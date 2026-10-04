@@ -1,0 +1,7 @@
+data/
+dist/
+/localaws
+/localaws.exe
+/localaws-linux
+*.sqlite*
+__pycache__/

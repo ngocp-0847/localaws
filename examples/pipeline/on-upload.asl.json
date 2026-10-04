@@ -1,0 +1,28 @@
+{
+  "Comment": "S3 object created -> one ECS task per object, retried once, failures recorded",
+  "StartAt": "Process",
+  "States": {
+    "Process": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "work",
+        "TaskDefinition": "worker",
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": { "AwsvpcConfiguration": { "Subnets": ["subnet-0a1b2c3d"], "SecurityGroups": ["sg-0a1b2c3d"] } },
+        "Overrides": {
+          "ContainerOverrides": [
+            { "Name": "app", "Command.$": "States.Array('sh', '-c', 'echo processing \"$1\"; echo \"greeting=$GREETING\"; echo endpoint=$AWS_ENDPOINT_URL', '--', $.detail.object.key)" }
+          ]
+        }
+      },
+      "ResultSelector": { "taskArn.$": "$.TaskArn", "exitCode.$": "$.Containers[0].ExitCode" },
+      "ResultPath": "$.task",
+      "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "MaxAttempts": 1, "IntervalSeconds": 2 } ],
+      "Catch": [ { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" } ],
+      "Next": "Done"
+    },
+    "Failed": { "Type": "Fail", "Error": "ProcessingFailed", "CausePath": "$.error.Cause" },
+    "Done": { "Type": "Succeed" }
+  }
+}

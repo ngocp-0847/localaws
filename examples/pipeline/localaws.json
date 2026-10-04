@@ -1,0 +1,29 @@
+{
+  "account": "123456789012",
+  "region": "eu-west-1",
+  "identity": "developer",
+  "runner": { "mode": "docker", "docker": { "images": { "123456789012.dkr.ecr.eu-west-1.amazonaws.com/worker:latest": "alpine:3" } } },
+  "resources": {
+    "s3": { "buckets": [ { "name": "inbox", "versioning": true, "eventBridge": true } ] },
+    "ec2": {
+      "subnets": [ { "id": "subnet-0a1b2c3d", "vpcId": "vpc-0a1b2c3d", "cidr": "10.0.1.0/24", "az": "${REGION}a" } ],
+      "securityGroups": [ { "id": "sg-0a1b2c3d", "name": "worker", "vpcId": "vpc-0a1b2c3d" } ]
+    },
+    "logs": { "groups": [ "/ecs/worker" ] },
+    "ssm": { "parameters": [ { "name": "/worker/greeting", "type": "SecureString", "value": "${env:GREETING:-hello from SSM}" } ] },
+    "ecs": {
+      "clusters": [ "work" ],
+      "taskDefinitions": [ { "specFile": "worker.taskdef.json" } ]
+    },
+    "stepFunctions": {
+      "stateMachines": [ { "name": "on-upload", "definitionFile": "on-upload.asl.json", "roleArn": "arn:aws:iam::${ACCOUNT}:role/states" } ]
+    },
+    "events": {
+      "rules": [ {
+        "name": "inbox-object-created",
+        "eventPattern": { "source": ["aws.s3"], "detail-type": ["Object Created"], "detail": { "bucket": { "name": ["inbox"] }, "object": { "key": [ { "prefix": "incoming/" } ] } } },
+        "targets": [ { "Id": "pipeline", "Arn": "arn:aws:states:${REGION}:${ACCOUNT}:stateMachine:on-upload" } ]
+      } ]
+    }
+  }
+}

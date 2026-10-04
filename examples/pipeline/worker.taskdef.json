@@ -1,0 +1,31 @@
+{
+  "family": "worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/worker:latest",
+      "essential": true,
+      "command": ["sh", "-c", "echo processing \"$1\"; echo \"greeting=$GREETING\"; echo endpoint=$AWS_ENDPOINT_URL", "--"],
+      "environment": [ { "name": "STAGE", "value": "local" } ],
+      "secrets": [ { "name": "GREETING", "valueFrom": "arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/worker/greeting" } ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "/ecs/worker", "awslogs-region": "${REGION}", "awslogs-stream-prefix": "worker" }
+      }
+    },
+    {
+      "name": "sidecar",
+      "image": "alpine:3",
+      "essential": false,
+      "command": ["sh", "-c", "echo sidecar up; sleep 30"],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "/ecs/worker", "awslogs-region": "${REGION}", "awslogs-stream-prefix": "worker" }
+      }
+    }
+  ]
+}
