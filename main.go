@@ -245,8 +245,12 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, M{"reset": true})
+	case p == "/api/info":
+		writeJSON(w, 200, a.consoleInfo())
+	case p == "/api/calls":
+		writeJSON(w, 200, a.consoleCalls())
 	default:
-		a.ui(w, r)
+		a.serveConsole(w, r, p)
 	}
 }
 

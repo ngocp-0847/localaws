@@ -1,7 +1,9 @@
 data/
-dist/
+/dist/
 /localaws
 /localaws.exe
 /localaws-linux
 *.sqlite*
 __pycache__/
+console/node_modules/
+e2e-shots/

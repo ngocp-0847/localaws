@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+/* AWS console palette (Cloudscape-like), as shadcn tokens */
+@theme {
+  --font-sans: "Amazon Ember", "Helvetica Neue", Roboto, Arial, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-background: var(--bg);
+  --color-foreground: var(--fg);
+  --color-card: var(--card);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-fg);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-fg);
+  --color-accent: var(--accent);
+  --color-link: var(--link);
+  --color-success: var(--success);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-nav: #232f3e;
+  --color-nav-2: #16191f;
+  --color-ring: var(--link);
+}
+
+:root {
+  --bg: #f2f3f3;
+  --fg: #16191f;
+  --card: #ffffff;
+  --muted: #fafafa;
+  --muted-fg: #5f6b7a;
+  --border: #d5dbdb;
+  --primary: #ff9900;
+  --primary-fg: #16191f;
+  --accent: #f1faff;
+  --link: #0972d3;
+  --success: #037f0c;
+  --danger: #d91515;
+  --warning: #8d6605;
+  --info: #0972d3;
+  color-scheme: light;
+}
+
+:root.dark {
+  --bg: #0f1b2a;
+  --fg: #d1d5db;
+  --card: #192534;
+  --muted: #1b2838;
+  --muted-fg: #8d99a8;
+  --border: #414d5c;
+  --primary: #ff9900;
+  --primary-fg: #0f1b2a;
+  --accent: #1d3044;
+  --link: #539fe5;
+  --success: #29ad32;
+  --danger: #ff5d64;
+  --warning: #e0ca57;
+  --info: #539fe5;
+  color-scheme: dark;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body { @apply bg-background text-foreground font-sans antialiased; font-size: 14px; }
+  * { border-color: var(--border); }
+  a { color: var(--link); }
+  code, pre, .mono { font-family: var(--font-mono); }
+  ::selection { background: #ffd49a; color: #16191f; }
+}

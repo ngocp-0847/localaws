@@ -5,3 +5,6 @@ localaws.exe
 localaws-linux
 examples
 .git
+console/node_modules
+console/src
+console/e2e

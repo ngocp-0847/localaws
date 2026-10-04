@@ -558,6 +558,16 @@ func (a *App) eventsAPI(op string, in M) (any, *apiError) {
 			entries = append(entries, M{"EventId": ev.ID})
 		}
 		return M{"Entries": entries, "FailedEntryCount": 0}, nil
+	case "TestEventPattern":
+		var pat map[string]any
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(getStr(in, "EventPattern")), &pat); err != nil {
+			return nil, errf(400, "InvalidEventPatternException", "Event pattern is not valid. Reason: %v", err)
+		}
+		if err := json.Unmarshal([]byte(getStr(in, "Event")), &ev); err != nil {
+			return nil, errf(400, "ValidationException", "Parameter Event is not valid. Reason: %v", err)
+		}
+		return M{"Result": matchPattern(pat, ev)}, nil
 	case "ListEventBuses":
 		return M{"EventBuses": []any{M{"Name": "default", "Arn": a.arn("events", "event-bus/default")}}}, nil
 	case "DescribeEventBus":

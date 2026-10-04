@@ -7,7 +7,10 @@ SQLite inside), one port, starts in well under a second.
 - State machines are **interpreted** state by state, with the execution history AWS would write.
 - ECS tasks **run**: as containers (docker), host processes (exec), or no-ops for pure orchestration tests.
 - S3 → EventBridge → Step Functions → ECS → CloudWatch Logs behaves as one pipeline, end to end.
-- Everything persists in `data/localaws.sqlite` and is browsable at `http://localhost:4566/_localaws/`.
+- Everything persists in `data/localaws.sqlite`.
+- A **web console** at `http://localhost:4566/_localaws/`, laid out like the AWS console, to look *and act*:
+  upload to S3, start / stop executions and watch them on the graph, run and stop tasks with their logs
+  live, edit parameters, send events — built into the binary.
 
 ## Quick start
 
@@ -36,7 +39,7 @@ aws stepfunctions list-executions --state-machine-arn arn:aws:states:us-east-1:0
 | Service | Operations | Behaviour that matches AWS |
 |---|---|---|
 | **S3** | buckets (create/delete/head/list, versioning, location, EventBridge notification), objects (put/get/head/delete/copy, `Range`, `If-Match`/`If-None-Match`, user metadata), ListObjects v1/v2 (prefix, delimiter, continuation), ListObjectVersions, DeleteObjects, multipart (create/upload part/complete/abort/list) | version ids and delete markers, `null` versions on unversioned buckets, multipart ETag `md5-of-md5s-N`, 5 MiB minimum part size, aws-chunked bodies (SigV4 streaming / CRC trailers), path- and virtual-host-style addressing, `BucketNotEmpty`, `NoSuchKey`, … |
-| **EventBridge** | Put/Describe/List/Delete/Enable/Disable rule, Put/Remove/List targets, PutEvents, ListRuleNamesByTarget | full pattern syntax (prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, exists, cidr, `$or`, arrays), Input / InputPath / InputTransformer, `rate()` schedules; S3 `Object Created` / `Object Deleted` events; targets: state machines, log groups |
+| **EventBridge** | Put/Describe/List/Delete/Enable/Disable rule, Put/Remove/List targets, PutEvents, TestEventPattern, ListRuleNamesByTarget | full pattern syntax (prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, exists, cidr, `$or`, arrays), Input / InputPath / InputTransformer, `rate()` schedules; S3 `Object Created` / `Object Deleted` events; targets: state machines, log groups |
 | **Step Functions** | Create/Update/Delete/Describe/List state machine, ValidateStateMachineDefinition, Start/StartSync/Stop/Describe/List execution, GetExecutionHistory, DescribeStateMachineForExecution | Task, Pass, Choice, Wait, Parallel, Map, Succeed, Fail; InputPath / Parameters / ResultSelector / ResultPath / OutputPath; context object `$$`; all `States.*` intrinsics; Retry (backoff, MaxDelaySeconds, jitter) and Catch; TimeoutSeconds; definition validation; history events with the real types and `previousEventId` chain. Integrations: `ecs:runTask(.sync)`, `states:startExecution(.sync/.sync:2)`, `events:putEvents`, `sns:publish` |
 | **ECS** | clusters, Register/Describe/List/Deregister task definition, RunTask, DescribeTasks, ListTasks, StopTask, Create/Update/Delete/Describe/List service | revisions, task lifecycle (PROVISIONING → PENDING → RUNNING → STOPPED), stop codes, exit codes per container, `essential`, awsvpc validation (network configuration, subnets), `secrets` from SSM, `environmentFiles` from S3, awslogs streams `<prefix>/<container>/<task id>`, services kept at `desiredCount` |
 | **CloudWatch Logs** | groups, streams, PutLogEvents, GetLogEvents, FilterLogEvents, retention | forward/backward tokens (same token = no more events), filter patterns incl. `{ $.field = value }` |
@@ -105,13 +108,39 @@ A task definition or state machine exported from a real account (`aws ecs descri
 `aws stepfunctions describe-state-machine`) can be dropped in as is; map its images with
 `runner.docker.images`, its ARNs follow `account` / `region`.
 
+## Web console
+
+`http://localhost:4566/_localaws/` — a small AWS-console look-alike for developers and QA. It speaks the
+same AWS protocols to the emulator that an application does, so what you click is what an SDK call does.
+
+| Service | What you can do |
+|---|---|
+| S3 | buckets (create with versioning / EventBridge, delete, toggle both), folder browser, drag-and-drop upload, preview, download, versions and delete markers, metadata |
+| Step Functions | state machines (create / edit with a live graph and ASL validation, delete), executions (start with input, stop, re-run with the same input); an execution's **Graph view** coloured by state, **Table view**, **Events**, input / output, per-state input, output, error and the ECS task it started |
+| ECS | clusters, tasks (running / stopped, stop), **Run task** (task definition, subnets, command and environment overrides), a task's containers, exit codes, stop reason and **live logs**; task definitions with revisions (register a new one from JSON, deregister); services (desired count) |
+| EventBridge | rules (create from a pattern or `rate()`, target picker, enable / disable, delete), **test a pattern** against an event, **send events** and see which rules match |
+| CloudWatch Logs | groups, streams by last event, a stream viewer that follows new lines (level filter, JSON expanded on click), group-wide search with filter patterns |
+| Parameter Store | list, create / edit (String, StringList, SecureString), reveal values, delete |
+| VPC · API activity | the declared subnets / security groups; every API call received, with status and duration |
+
+Top bar: service search (`Alt+S`), auto-refresh switch, light / dark, account menu (identity, runner,
+**Reset emulator**). Stack: React 19 + TypeScript, Zustand, Tailwind CSS 4, shadcn/ui on Radix, Vite;
+~145 KB gzipped, embedded in the Go binary (`console/dist` is committed, so `go build` needs no Node).
+
+```bash
+make console        # rebuild console/dist after changing console/src
+make console-dev    # hot reload on :5173, API calls proxied to LOCALAWS_URL (default http://localhost:4566)
+make console-test   # drives the console in your installed Chrome (playwright-core): 12 QA flows
+```
+
 ## Admin
 
 | | |
 |---|---|
 | `GET /_localaws/health` | status, version, runner |
 | `POST /_localaws/reset` | stop everything, wipe all data, re-apply the config |
-| `/_localaws/` | console: executions + history, tasks + container logs, bucket versions, log groups, parameters, API calls |
+| `GET /_localaws/api/info` · `/api/calls` | what the console's header and API activity page read |
+| `/_localaws/` | the web console |
 
 ## Development
 
@@ -122,7 +151,7 @@ make release   # static binaries for linux/darwin/windows × amd64/arm64 in dist
 
 Layout: `main.go` (server, routing, admin) · `config.go` · `store.go` (SQLite) · `proto.go` (wire helpers) ·
 `s3.go` · `events.go` · `sfn.go` + `asl.go` (Step Functions) · `ecs.go` + `runner.go` · `logs.go` · `ssm.go` ·
-`query.go` (STS/EC2/SNS) · `ui.go`.
+`query.go` (STS/EC2/SNS) · `console.go` (embedded web console) · `console/` (its React source).
 
 ## Not emulated (yet)
 

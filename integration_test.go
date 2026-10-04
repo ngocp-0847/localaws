@@ -263,3 +263,21 @@ func TestStopExecutionStopsTask(t *testing.T) {
 		t.Fatalf("stopped tasks = %v", tasks)
 	}
 }
+
+func TestConsoleAndPatternTester(t *testing.T) {
+	_, c := newTestApp(t)
+	r, body := c.raw("GET", "/_localaws/", nil, map[string]string{"Accept-Encoding": "gzip"})
+	if r.StatusCode != 200 || !strings.Contains(r.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("console index: %d %s", r.StatusCode, r.Header.Get("Content-Type"))
+	}
+	_ = body
+	info := c.raw
+	if r, b := info("GET", "/_localaws/api/info", nil, nil); r.StatusCode != 200 || !strings.Contains(string(b), `"account":"123456789012"`) {
+		t.Fatalf("api/info: %d %s", r.StatusCode, b)
+	}
+	got := c.call("AWSEvents.TestEventPattern", M{"EventPattern": `{"source":["my.app"],"detail":{"n":[{"numeric":[">",1]}]}}`,
+		"Event": `{"id":"1","source":"my.app","detail-type":"x","detail":{"n":5}}`})
+	if got["Result"] != true {
+		t.Fatalf("TestEventPattern = %v", got)
+	}
+}
