@@ -23,8 +23,13 @@ type KV struct {
 }
 
 type Cluster struct {
-	Name    string `json:"name"`
-	Created int64  `json:"created"`
+	Name     string `json:"name"`
+	Created  int64  `json:"created"`
+	Settings []any  `json:"settings,omitempty"`
+	Config   M      `json:"config,omitempty"`
+	CPs      []any  `json:"capacityProviders,omitempty"`
+	Strategy []any  `json:"strategy,omitempty"`
+	SCDef    M      `json:"serviceConnectDefaults,omitempty"`
 }
 
 type TaskDef struct {
@@ -98,7 +103,16 @@ type Service struct {
 	Network    M      `json:"network,omitempty"`
 	Status     string `json:"status"`
 	Created    int64  `json:"created"`
+	Spec       M      `json:"spec,omitempty"` // the rest of the CreateService / UpdateService request, read back as sent
 }
+
+func (a *App) serviceArn(s Service) string { return a.arn("ecs", "service/"+s.Cluster+"/"+s.Name) }
+
+// serviceSpecKeys: the CreateService / UpdateService fields kept verbatim in Service.Spec.
+var serviceSpecKeys = []string{"loadBalancers", "serviceRegistries", "deploymentConfiguration", "deploymentController", "placementConstraints",
+	"placementStrategy", "enableECSManagedTags", "propagateTags", "enableExecuteCommand", "healthCheckGracePeriodSeconds", "platformVersion",
+	"capacityProviderStrategy", "schedulingStrategy", "role", "serviceConnectConfiguration", "availabilityZoneRebalancing", "volumeConfigurations",
+	"vpcLatticeConfigurations"}
 
 func (a *App) clusterArn(n string) string { return a.arn("ecs", "cluster/"+n) }
 func (a *App) tdArn(td TaskDef) string {
@@ -278,7 +292,7 @@ func (a *App) runTask(in M, defaultStartedBy, execArn string) (*Task, *apiError)
 		if len(subnets) == 0 {
 			return nil, errf(400, "InvalidParameterException", "Network Configuration must be provided when networkMode 'awsvpc' is specified.")
 		}
-		if known := a.cfg.Subnets(); len(known) > 0 {
+		if known := a.subnetIDs(); len(known) > 0 {
 			for _, s := range subnets {
 				if !known[s] {
 					return nil, errf(400, "InvalidParameterException", "Error retrieving subnet information for [%s]: The subnet ID '%s' does not exist", s, s)
@@ -473,7 +487,12 @@ func (a *App) containerEnv(def, ov M) ([]KV, error) {
 		if i := strings.Index(from, ":parameter"); strings.HasPrefix(from, "arn:") && i >= 0 {
 			name = from[i+len(":parameter"):]
 		} else if strings.HasPrefix(from, "arn:aws:secretsmanager") {
-			return nil, fmt.Errorf("unable to pull secrets or registry auth: localaws does not emulate Secrets Manager (%s)", from)
+			v, ok := a.secretValue(from)
+			if !ok {
+				return nil, fmt.Errorf("unable to pull secrets or registry auth: execution resource retrieval failed: unable to retrieve secret from asm: service call has been retried 1 time(s): ResourceNotFoundException: Secrets Manager can't find the specified secret: %s", from)
+			}
+			set(getStr(sm, "name"), v)
+			continue
 		}
 		p, ok := a.param(name)
 		if !ok {
@@ -613,6 +632,9 @@ func (a *App) reconcile(stop <-chan struct{}) {
 					live = append(live, t)
 				}
 			}
+			if s.Status == "INACTIVE" {
+				continue
+			}
 			want := s.Desired
 			if s.Status != "ACTIVE" {
 				want = 0
@@ -632,7 +654,8 @@ func (a *App) reconcile(stop <-chan struct{}) {
 				a.stopTask(live[i].ID, "Scaling activity initiated by (deployment ecs-svc/"+s.Name+")")
 			}
 			if s.Status == "DRAINING" && len(live) == 0 {
-				_ = a.db.del("service", s.Cluster+"/"+s.Name)
+				s.Status = "INACTIVE" // stays describable for a while, as on AWS
+				_ = a.db.put("service", s.Cluster+"/"+s.Name, s)
 			}
 		}
 	}
@@ -650,9 +673,27 @@ func (a *App) serviceOut(s Service) M {
 			}
 		}
 	}
-	m := M{"serviceName": s.Name, "serviceArn": a.arn("ecs", "service/"+s.Cluster+"/"+s.Name), "clusterArn": a.clusterArn(s.Cluster),
-		"status": s.Status, "desiredCount": s.Desired, "runningCount": running, "pendingCount": pending, "launchType": s.LaunchType,
-		"taskDefinition": s.TaskDef, "createdAt": epoch(s.Created), "deployments": []any{}, "events": []any{}}
+	m := M{"deploymentConfiguration": M{"deploymentCircuitBreaker": M{"enable": false, "rollback": false}, "maximumPercent": 200, "minimumHealthyPercent": 100},
+		"deploymentController": M{"type": "ECS"}, "schedulingStrategy": "REPLICA", "loadBalancers": []any{}, "serviceRegistries": []any{},
+		"placementConstraints": []any{}, "placementStrategy": []any{}, "enableECSManagedTags": false, "propagateTags": "NONE", "enableExecuteCommand": false}
+	if s.LaunchType == "FARGATE" {
+		m["platformVersion"], m["platformFamily"] = "LATEST", "Linux"
+	}
+	for k, v := range s.Spec {
+		m[k] = v
+	}
+	computed := M{"serviceName": s.Name, "serviceArn": a.serviceArn(s), "clusterArn": a.clusterArn(s.Cluster), "status": s.Status,
+		"desiredCount": s.Desired, "runningCount": running, "pendingCount": pending, "taskDefinition": s.TaskDef, "createdAt": epoch(s.Created),
+		"createdBy": a.cfg.IdentityArn(), "events": []any{},
+		"deployments": []any{M{"id": "ecs-svc/" + strconv.FormatInt(s.Created, 10), "status": "PRIMARY", "taskDefinition": s.TaskDef,
+			"desiredCount": s.Desired, "runningCount": running, "pendingCount": pending, "failedTasks": 0, "createdAt": epoch(s.Created),
+			"updatedAt": epoch(s.Created), "launchType": s.LaunchType, "rolloutState": "COMPLETED", "rolloutStateReason": "ECS deployment completed."}}}
+	for k, v := range computed {
+		m[k] = v
+	}
+	if s.LaunchType != "" {
+		m["launchType"] = s.LaunchType
+	}
 	if len(s.Network) > 0 {
 		m["networkConfiguration"] = s.Network
 	}
@@ -675,17 +716,44 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 			name = "default"
 		}
 		if !a.db.has("cluster", name) {
-			_ = a.db.put("cluster", name, Cluster{Name: name, Created: nowMs()})
+			_ = a.db.put("cluster", name, Cluster{Name: name, Created: nowMs(), Settings: getList(in, "settings"), Config: getMap(in, "configuration"),
+				CPs: getList(in, "capacityProviders"), Strategy: getList(in, "defaultCapacityProviderStrategy"), SCDef: getMap(in, "serviceConnectDefaults")})
 		}
+		a.tagResource(a.clusterArn(name), tagsFromList(getList(in, "tags"), "key", "value"))
 		return M{"cluster": a.clusterOut(name)}, nil
+	case "UpdateCluster", "UpdateClusterSettings", "PutClusterCapacityProviders":
+		var c Cluster
+		if !a.db.get("cluster", clusterOf(), &c) {
+			return nil, errf(400, "ClusterNotFoundException", "Cluster not found.")
+		}
+		if _, ok := in["settings"]; ok {
+			c.Settings = getList(in, "settings")
+		}
+		if _, ok := in["configuration"]; ok {
+			c.Config = getMap(in, "configuration")
+		}
+		if _, ok := in["serviceConnectDefaults"]; ok {
+			c.SCDef = getMap(in, "serviceConnectDefaults")
+		}
+		if op == "PutClusterCapacityProviders" {
+			c.CPs, c.Strategy = getList(in, "capacityProviders"), getList(in, "defaultCapacityProviderStrategy")
+		}
+		_ = a.db.put("cluster", c.Name, c)
+		return M{"cluster": a.clusterOut(c.Name)}, nil
 	case "DeleteCluster":
 		name := clusterOf()
 		if !a.db.has("cluster", name) {
 			return nil, errf(400, "ClusterNotFoundException", "Cluster not found.")
 		}
-		_ = a.db.del("cluster", name)
+		for _, sv := range list[Service](a.db, "service") {
+			if sv.Cluster == name && sv.Status != "INACTIVE" {
+				return nil, errf(400, "ClusterContainsServicesException", "The Cluster cannot be deleted while Services are active.")
+			}
+		}
 		out := a.clusterOut(name)
 		out["status"] = "INACTIVE"
+		_ = a.db.del("cluster", name)
+		a.untagAll(a.clusterArn(name))
 		return M{"cluster": out}, nil
 	case "DescribeClusters":
 		names := strList(getList(in, "clusters"))
@@ -708,17 +776,31 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 		}
 		return M{"clusterArns": out}, nil
 	case "RegisterTaskDefinition":
+		tags := tagsFromList(getList(in, "tags"), "key", "value")
+		delete(in, "tags")
 		td, e := a.registerTaskDef(in)
 		if e != nil {
 			return nil, e
 		}
-		return M{"taskDefinition": a.taskDefOut(td), "tags": []any{}}, nil
+		a.tagResource(a.tdArn(td), tags)
+		return M{"taskDefinition": a.taskDefOut(td), "tags": tagList(tags, "key", "value")}, nil
 	case "DescribeTaskDefinition":
 		td, ok := a.findTaskDef(getStr(in, "taskDefinition"))
 		if !ok {
 			return nil, errf(400, "ClientException", "Unable to describe task definition.")
 		}
-		return M{"taskDefinition": a.taskDefOut(td), "tags": []any{}}, nil
+		return M{"taskDefinition": a.taskDefOut(td), "tags": tagList(a.tagsOf(a.tdArn(td)), "key", "value")}, nil
+	case "DeleteTaskDefinitions":
+		out := []any{}
+		for _, ref := range strList(getList(in, "taskDefinitions")) {
+			if td, ok := a.findTaskDef(ref); ok {
+				td.Status = "DELETE_IN_PROGRESS"
+				_ = a.db.del("taskdef", fmt.Sprintf("%s:%d", td.Family, td.Revision))
+				a.untagAll(a.tdArn(td))
+				out = append(out, a.taskDefOut(td))
+			}
+		}
+		return M{"taskDefinitions": out, "failures": []any{}}, nil
 	case "DeregisterTaskDefinition":
 		td, ok := a.findTaskDef(getStr(in, "taskDefinition"))
 		if !ok {
@@ -831,16 +913,38 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 		if !a.db.has("cluster", s.Cluster) {
 			return nil, errf(400, "ClusterNotFoundException", "Cluster not found.")
 		}
-		if a.db.has("service", s.Cluster+"/"+s.Name) {
+		var old Service
+		if a.db.get("service", s.Cluster+"/"+s.Name, &old) && old.Status != "INACTIVE" {
 			return nil, errf(400, "InvalidParameterException", "Creation of service was not idempotent.")
 		}
 		s.TaskDef = a.tdArn(td)
+		s.Spec = M{}
+		for _, k := range serviceSpecKeys {
+			if v, ok := in[k]; ok {
+				s.Spec[k] = v
+			}
+		}
 		_ = a.db.put("service", s.Cluster+"/"+s.Name, s)
+		a.tagResource(a.serviceArn(s), tagsFromList(getList(in, "tags"), "key", "value"))
 		return M{"service": a.serviceOut(s)}, nil
 	case "UpdateService":
 		var s Service
 		if !a.db.get("service", clusterOf()+"/"+arnTail(getStr(in, "service")), &s) {
 			return nil, errf(400, "ServiceNotFoundException", "Service not found.")
+		}
+		if s.Status != "ACTIVE" {
+			return nil, errf(400, "ServiceNotActiveException", "Service was not ACTIVE.")
+		}
+		if s.Spec == nil {
+			s.Spec = M{}
+		}
+		for _, k := range serviceSpecKeys {
+			if v, ok := in[k]; ok {
+				s.Spec[k] = v
+			}
+		}
+		if nc, ok := in["networkConfiguration"]; ok {
+			s.Network, _ = nc.(map[string]any)
 		}
 		if _, ok := in["desiredCount"]; ok {
 			s.Desired = getInt(in, "desiredCount", s.Desired)
@@ -859,10 +963,14 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 		if !a.db.get("service", clusterOf()+"/"+arnTail(getStr(in, "service")), &s) {
 			return nil, errf(400, "ServiceNotFoundException", "Service not found.")
 		}
+		if s.Status == "INACTIVE" {
+			return nil, errf(400, "ServiceNotActiveException", "Service was not ACTIVE.")
+		}
 		if s.Desired > 0 && !getBool(in, "force") {
 			return nil, errf(400, "InvalidParameterException", "The service cannot be stopped while it is scaled above 0.")
 		}
 		s.Status, s.Desired = "DRAINING", 0
+		a.untagAll(a.serviceArn(s))
 		_ = a.db.put("service", s.Cluster+"/"+s.Name, s)
 		return M{"service": a.serviceOut(s)}, nil
 	case "DescribeServices":
@@ -870,7 +978,11 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 		for _, ref := range strList(getList(in, "services")) {
 			var s Service
 			if a.db.get("service", clusterOf()+"/"+arnTail(ref), &s) {
-				out = append(out, a.serviceOut(s))
+				so := a.serviceOut(s)
+				if contains(strList(getList(in, "include")), "TAGS") {
+					so["tags"] = tagList(a.tagsOf(a.serviceArn(s)), "key", "value")
+				}
+				out = append(out, so)
 			} else {
 				fails = append(fails, M{"arn": ref, "reason": "MISSING"})
 			}
@@ -879,15 +991,25 @@ func (a *App) ecsAPI(op string, in M) (any, *apiError) {
 	case "ListServices":
 		out := []any{}
 		for _, s := range list[Service](a.db, "service") {
-			if s.Cluster == clusterOf() {
-				out = append(out, a.arn("ecs", "service/"+s.Cluster+"/"+s.Name))
+			if s.Cluster == clusterOf() && s.Status != "INACTIVE" {
+				out = append(out, a.serviceArn(s))
 			}
 		}
 		return M{"serviceArns": out}, nil
-	case "TagResource", "UntagResource":
+	case "TagResource":
+		a.tagResource(getStr(in, "resourceArn"), tagsFromList(getList(in, "tags"), "key", "value"))
+		return M{}, nil
+	case "UntagResource":
+		a.untagResource(getStr(in, "resourceArn"), strList(getList(in, "tagKeys")))
 		return M{}, nil
 	case "ListTagsForResource":
-		return M{"tags": []any{}}, nil
+		return M{"tags": tagList(a.tagsOf(getStr(in, "resourceArn")), "key", "value")}, nil
+	case "DescribeCapacityProviders":
+		out := []any{}
+		for _, n := range []string{"FARGATE", "FARGATE_SPOT"} {
+			out = append(out, M{"capacityProviderArn": a.arn("ecs", "capacity-provider/"+n), "name": n, "status": "ACTIVE", "tags": []any{}})
+		}
+		return M{"capacityProviders": out, "failures": []any{}}, nil
 	}
 	return nil, errf(400, "UnknownOperationException", "localaws ecs: %s is not implemented", op)
 }
@@ -904,9 +1026,36 @@ func (a *App) clusterOut(name string) M {
 			}
 		}
 	}
-	return M{"clusterArn": a.clusterArn(name), "clusterName": name, "status": "ACTIVE", "runningTasksCount": running,
-		"pendingTasksCount": pending, "activeServicesCount": len(list[Service](a.db, "service")), "registeredContainerInstancesCount": 0,
-		"capacityProviders": []any{"FARGATE", "FARGATE_SPOT"}, "settings": []any{}, "tags": []any{}}
+	var c Cluster
+	a.db.get("cluster", name, &c)
+	services := 0
+	for _, s := range list[Service](a.db, "service") {
+		if s.Cluster == name && s.Status == "ACTIVE" {
+			services++
+		}
+	}
+	settings := c.Settings
+	if len(settings) == 0 {
+		settings = []any{M{"name": "containerInsights", "value": "disabled"}}
+	}
+	cps, strategy := c.CPs, c.Strategy
+	if cps == nil {
+		cps = []any{}
+	}
+	if strategy == nil {
+		strategy = []any{}
+	}
+	m := M{"clusterArn": a.clusterArn(name), "clusterName": name, "status": "ACTIVE", "runningTasksCount": running,
+		"pendingTasksCount": pending, "activeServicesCount": services, "registeredContainerInstancesCount": 0,
+		"capacityProviders": cps, "defaultCapacityProviderStrategy": strategy, "settings": settings, "statistics": []any{}, "attachments": []any{},
+		"tags": tagList(a.tagsOf(a.clusterArn(name)), "key", "value")}
+	if len(c.Config) > 0 {
+		m["configuration"] = c.Config
+	}
+	if len(c.SCDef) > 0 {
+		m["serviceConnectDefaults"] = c.SCDef
+	}
+	return m
 }
 
 var _ = json.Marshal

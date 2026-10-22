@@ -2,13 +2,16 @@ BIN      := localaws
 LDFLAGS  := -s -w
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
-.PHONY: build test release image clean console console-dev console-test
+.PHONY: build test test-terraform release image clean console console-dev console-test
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) .
 
 test:
 	go vet ./... && go test -count=1 ./...
+
+test-terraform:         # the real AWS provider: apply → plan clean → update → plan clean → destroy (needs terraform)
+	scripts/test-terraform.sh
 
 release:
 	@mkdir -p dist

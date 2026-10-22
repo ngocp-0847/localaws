@@ -47,8 +47,10 @@ func openStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
-		return nil, err
+	for _, ddl := range []string{schema, sqsSchema, sesSchema} {
+		if _, err := db.Exec(ddl); err != nil {
+			return nil, err
+		}
 	}
 	return &Store{db: db, dir: dir}, nil
 }
@@ -123,7 +125,7 @@ func (s *Store) blobPath(name string) string { return filepath.Join(s.dir, "blob
 func (s *Store) reset() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, t := range []string{"resources", "s3_objects", "s3_parts", "sfn_events", "log_events", "counters"} {
+	for _, t := range []string{"resources", "s3_objects", "s3_parts", "sfn_events", "log_events", "counters", "sqs_messages", "ses_messages", "sns_messages"} {
 		if _, err := s.db.Exec("DELETE FROM " + t); err != nil {
 			return err
 		}

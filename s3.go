@@ -12,6 +12,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -25,18 +26,28 @@ import (
 )
 
 type Bucket struct {
-	Name        string `json:"name"`
-	Created     int64  `json:"created"`
-	Versioning  string `json:"versioning"` // "" | Enabled | Suspended
-	EventBridge bool   `json:"eventBridge"`
+	Name        string            `json:"name"`
+	Created     int64             `json:"created"`
+	Versioning  string            `json:"versioning"` // "" | Enabled | Suspended
+	EventBridge bool              `json:"eventBridge"`
+	Config      map[string]string `json:"config,omitempty"` // subresource (policy, tagging, cors, …) → the document as PUT
+	ObjectLock  bool              `json:"objectLock,omitempty"`
+	MFADelete   string            `json:"mfaDelete,omitempty"`
 }
 
 type objMeta struct {
 	ContentType        string            `json:"contentType,omitempty"`
 	ContentEncoding    string            `json:"contentEncoding,omitempty"`
 	ContentDisposition string            `json:"contentDisposition,omitempty"`
+	ContentLanguage    string            `json:"contentLanguage,omitempty"`
 	CacheControl       string            `json:"cacheControl,omitempty"`
+	Expires            string            `json:"expires,omitempty"`
+	StorageClass       string            `json:"storageClass,omitempty"`
+	SSE                string            `json:"sse,omitempty"`
+	SSEKMSKeyID        string            `json:"sseKmsKeyId,omitempty"`
+	WebsiteRedirect    string            `json:"websiteRedirect,omitempty"`
 	User               map[string]string `json:"user,omitempty"`
+	Tags               map[string]string `json:"tags,omitempty"`
 	Parts              int               `json:"parts,omitempty"`
 }
 
@@ -98,6 +109,12 @@ func (a *App) s3(w http.ResponseWriter, r *http.Request) {
 		s3Err(w, 404, "NoSuchBucket", "The specified bucket does not exist", "/"+bucket)
 		return
 	}
+	for _, sub := range unsupportedObjectSubresources {
+		if q.Has(sub) {
+			s3Err(w, 501, "NotImplemented", "localaws s3: object "+sub+" is not implemented", "/"+bucket+"/"+key)
+			return
+		}
+	}
 	switch {
 	case r.Method == http.MethodPost && q.Has("uploads"):
 		a.s3CreateUpload(w, r, b, key)
@@ -111,10 +128,14 @@ func (a *App) s3(w http.ResponseWriter, r *http.Request) {
 		a.s3ListParts(w, b, key, q.Get("uploadId"))
 	case r.Method == http.MethodPut && r.Header.Get("x-amz-copy-source") != "":
 		a.s3Copy(w, r, b, key)
-	case r.Method == http.MethodPut && (q.Has("tagging") || q.Has("acl")):
+	case q.Has("tagging"):
+		a.s3ObjectTagging(w, r, b, key, q.Get("versionId"))
+	case q.Has("acl"):
+		if r.Method == http.MethodGet {
+			writeXML(w, 200, a.s3ACL())
+			return
+		}
 		w.WriteHeader(200)
-	case r.Method == http.MethodGet && q.Has("tagging"):
-		writeXML(w, 200, "<Tagging "+s3ns+"><TagSet/></Tagging>")
 	case r.Method == http.MethodPut:
 		a.s3Put(w, r, b, key)
 	case r.Method == http.MethodGet, r.Method == http.MethodHead:
@@ -126,15 +147,101 @@ func (a *App) s3(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bucketConfigs: the bucket subresources kept as the documents they were PUT with, and
+// what GET answers while one is not set — the error code SDKs and Terraform recognise as
+// "not configured", or the default AWS reports.
+var bucketConfigs = map[string]struct {
+	code, msg string // 404 answer when unset
+	def       string // or this default document
+}{
+	"policy":            {"NoSuchBucketPolicy", "The bucket policy does not exist", ""},
+	"tagging":           {"NoSuchTagSet", "The TagSet does not exist", ""},
+	"cors":              {"NoSuchCORSConfiguration", "The CORS configuration does not exist", ""},
+	"lifecycle":         {"NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist", ""},
+	"website":           {"NoSuchWebsiteConfiguration", "The specified bucket does not have a website configuration", ""},
+	"publicAccessBlock": {"NoSuchPublicAccessBlockConfiguration", "The public access block configuration was not found", ""},
+	"ownershipControls": {"OwnershipControlsNotFoundError", "The bucket ownership controls were not found", ""},
+	"replication":       {"ReplicationConfigurationNotFoundError", "The replication configuration was not found", ""},
+	"object-lock":       {"ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket", ""},
+	"encryption": {"", "", "<ServerSideEncryptionConfiguration " + s3ns + "><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>" +
+		"</ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>"},
+	"accelerate":     {"", "", "<AccelerateConfiguration " + s3ns + "/>"},
+	"requestPayment": {"", "", "<RequestPaymentConfiguration " + s3ns + "><Payer>BucketOwner</Payer></RequestPaymentConfiguration>"},
+	"logging":        {"", "", "<BucketLoggingStatus " + s3ns + "/>"},
+	"acl":            {"", "", ""}, // see s3ACL
+}
+
+// listed configurations (analytics, metrics, …): empty lists, and no single one exists.
+var bucketConfigLists = map[string]string{
+	"analytics": "ListBucketAnalyticsConfigurationResult", "metrics": "ListMetricsConfigurationsResult",
+	"inventory": "ListInventoryConfigurationsResult", "intelligent-tiering": "ListBucketIntelligentTieringConfigurationsResult",
+}
+
+func (a *App) s3ACL() string {
+	owner := "<ID>" + a.cfg.Account + "</ID><DisplayName>localaws</DisplayName>"
+	return "<AccessControlPolicy " + s3ns + "><Owner>" + owner + "</Owner><AccessControlList><Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">" +
+		owner + "</Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"
+}
+
+// subresource names the bucket configuration a request addresses ("" for none).
+func subresource(q url.Values) string {
+	for k := range bucketConfigs {
+		if q.Has(k) {
+			return k
+		}
+	}
+	for k := range bucketConfigLists {
+		if q.Has(k) {
+			return k
+		}
+	}
+	for _, k := range []string{"versioning", "notification", "location", "versions", "uploads", "delete", "policyStatus"} {
+		if q.Has(k) {
+			return k
+		}
+	}
+	for k := range q { // a configuration this emulator does not know: kept generically ("?name")
+		if !plainParams[k] && !strings.HasPrefix(strings.ToLower(k), "x-amz-") && !strings.HasPrefix(k, "response-") {
+			return "?" + k
+		}
+	}
+	return ""
+}
+
+// plainParams: query parameters that are arguments, not subresources.
+var plainParams = map[string]bool{"x-id": true, "list-type": true, "prefix": true, "delimiter": true, "marker": true, "max-keys": true,
+	"continuation-token": true, "start-after": true, "encoding-type": true, "fetch-owner": true, "key-marker": true, "version-id-marker": true,
+	"upload-id-marker": true, "max-uploads": true, "versionId": true, "allow-unordered": true, "id": true}
+
+// unsupportedObjectSubresources answer 501 rather than being taken for a PutObject / GetObject.
+var unsupportedObjectSubresources = []string{"retention", "legal-hold", "attributes", "torrent", "restore", "select", "renameObject"}
+
 func (a *App) s3Bucket(w http.ResponseWriter, r *http.Request, name string, q url.Values) {
 	var b Bucket
 	exists := a.db.get("bucket", name, &b)
-	if r.Method == http.MethodPut && !q.Has("versioning") && !q.Has("notification") && !q.Has("tagging") && !q.Has("policy") && !q.Has("acl") && !q.Has("cors") && !q.Has("lifecycle") {
+	sub := subresource(q)
+	if r.Method == http.MethodPut && sub == "" {
 		if exists {
 			s3Err(w, 409, "BucketAlreadyOwnedByYou", "Your previous request to create the named bucket succeeded and you already own it.", "/"+name)
 			return
 		}
-		if err := a.createBucket(Bucket{Name: name}); err != nil {
+		nb := Bucket{Name: name, ObjectLock: strings.EqualFold(r.Header.Get("x-amz-bucket-object-lock-enabled"), "true")}
+		if nb.ObjectLock {
+			nb.Versioning = "Enabled"
+		}
+		if body, _ := readBody(r); len(body) > 0 { // CreateBucketConfiguration may carry the bucket's tags
+			var cfg struct {
+				Tags struct{ Tag []struct{ Key, Value string } }
+			}
+			if xml.Unmarshal(body, &cfg) == nil && len(cfg.Tags.Tag) > 0 {
+				tags := map[string]string{}
+				for _, t := range cfg.Tags.Tag {
+					tags[t.Key] = t.Value
+				}
+				defer func() { a.setBucketTags(Bucket{Name: name}, tags) }()
+			}
+		}
+		if err := a.createBucket(nb); err != nil {
 			s3Err(w, 400, "InvalidBucketName", err.Error(), "/"+name)
 			return
 		}
@@ -146,61 +253,168 @@ func (a *App) s3Bucket(w http.ResponseWriter, r *http.Request, name string, q ur
 		s3Err(w, 404, "NoSuchBucket", "The specified bucket does not exist", "/"+name)
 		return
 	}
+	if cfg, ok := bucketConfigs[sub]; ok {
+		a.s3BucketConfig(w, r, b, sub, cfg.code, cfg.msg, cfg.def)
+		return
+	}
+	if strings.HasPrefix(sub, "?") {
+		a.s3BucketConfig(w, r, b, sub[1:], "NoSuchConfiguration", "The specified configuration does not exist.", "")
+		return
+	}
+	if root, ok := bucketConfigLists[sub]; ok {
+		if r.Method == http.MethodGet && q.Get("id") == "" {
+			writeXML(w, 200, "<"+root+" "+s3ns+"><IsTruncated>false</IsTruncated></"+root+">")
+			return
+		}
+		if r.Method == http.MethodGet {
+			s3Err(w, 404, "NoSuchConfiguration", "The specified configuration does not exist.", "/"+name)
+			return
+		}
+		w.WriteHeader(204)
+		return
+	}
 	switch {
 	case r.Method == http.MethodHead:
 		w.Header().Set("x-amz-bucket-region", a.cfg.Region)
 		w.WriteHeader(200)
-	case r.Method == http.MethodDelete && len(q) == 0:
+	case r.Method == http.MethodDelete && sub == "":
 		if len(a.s3Objects(name, "", true)) > 0 {
 			s3Err(w, 409, "BucketNotEmpty", "The bucket you tried to delete is not empty", "/"+name)
 			return
 		}
 		_ = a.db.del("bucket", name)
 		w.WriteHeader(204)
-	case r.Method == http.MethodPut && q.Has("versioning"):
-		body, _ := io.ReadAll(r.Body)
-		var v struct{ Status string }
+	case r.Method == http.MethodPut && sub == "versioning":
+		body, _ := readBody(r)
+		var v struct{ Status, MfaDelete string }
 		_ = xml.Unmarshal(body, &v)
 		if v.Status != "Enabled" && v.Status != "Suspended" {
 			s3Err(w, 400, "MalformedXML", "versioning Status must be Enabled or Suspended", "/"+name)
 			return
 		}
-		b.Versioning = v.Status
+		b.Versioning, b.MFADelete = v.Status, v.MfaDelete
 		_ = a.db.put("bucket", name, b)
 		w.WriteHeader(200)
-	case r.Method == http.MethodGet && q.Has("versioning"):
+	case r.Method == http.MethodGet && sub == "versioning":
 		st := ""
 		if b.Versioning != "" {
 			st = "<Status>" + b.Versioning + "</Status>"
+			if b.MFADelete != "" {
+				st += "<MfaDelete>" + b.MFADelete + "</MfaDelete>"
+			}
 		}
 		writeXML(w, 200, "<VersioningConfiguration "+s3ns+">"+st+"</VersioningConfiguration>")
-	case r.Method == http.MethodPut && q.Has("notification"):
-		body, _ := io.ReadAll(r.Body)
+	case r.Method == http.MethodPut && sub == "notification":
+		body, _ := readBody(r)
 		b.EventBridge = bytes.Contains(body, []byte("EventBridgeConfiguration"))
+		if b.Config == nil {
+			b.Config = map[string]string{}
+		}
+		b.Config["notification"] = string(body)
 		_ = a.db.put("bucket", name, b)
 		w.WriteHeader(200)
-	case r.Method == http.MethodGet && q.Has("notification"):
+	case r.Method == http.MethodGet && sub == "notification":
+		if doc := b.Config["notification"]; doc != "" {
+			writeXML(w, 200, strings.TrimPrefix(strings.TrimSpace(doc), xml.Header))
+			return
+		}
 		eb := ""
 		if b.EventBridge {
 			eb = "<EventBridgeConfiguration/>"
 		}
 		writeXML(w, 200, "<NotificationConfiguration "+s3ns+">"+eb+"</NotificationConfiguration>")
-	case r.Method == http.MethodGet && q.Has("location"):
-		writeXML(w, 200, "<LocationConstraint "+s3ns+">"+a.cfg.Region+"</LocationConstraint>")
-	case r.Method == http.MethodGet && q.Has("versions"):
+	case r.Method == http.MethodGet && sub == "location":
+		loc := a.cfg.Region
+		if loc == "us-east-1" {
+			loc = ""
+		}
+		writeXML(w, 200, "<LocationConstraint "+s3ns+">"+loc+"</LocationConstraint>")
+	case r.Method == http.MethodGet && sub == "policyStatus":
+		writeXML(w, 200, "<PolicyStatus "+s3ns+"><IsPublic>false</IsPublic></PolicyStatus>")
+	case r.Method == http.MethodGet && sub == "versions":
 		a.s3ListVersions(w, b, q)
-	case r.Method == http.MethodGet && q.Has("uploads"):
+	case r.Method == http.MethodGet && sub == "uploads":
 		a.s3ListUploads(w, b)
-	case r.Method == http.MethodPost && q.Has("delete"):
+	case r.Method == http.MethodPost && sub == "delete":
 		a.s3DeleteObjects(w, r, b)
-	case r.Method == http.MethodGet && (q.Has("tagging") || q.Has("policy") || q.Has("cors") || q.Has("lifecycle")):
-		s3Err(w, 404, "NoSuchConfiguration", "The specified configuration does not exist.", "/"+name)
-	case r.Method == http.MethodPut || r.Method == http.MethodDelete:
-		w.WriteHeader(200) // tagging / policy / acl / cors / lifecycle: accepted, not enforced
-	case r.Method == http.MethodGet:
+	case r.Method == http.MethodGet && sub == "":
 		a.s3List(w, b, q)
 	default:
 		s3Err(w, 405, "MethodNotAllowed", "The specified method is not allowed against this resource.", "/"+name)
+	}
+}
+
+// s3BucketConfig: PUT keeps the document, GET gives it back (or the default / the
+// "not configured" error), DELETE forgets it.
+func (a *App) s3BucketConfig(w http.ResponseWriter, r *http.Request, b Bucket, sub, code, msg, def string) {
+	if b.Config == nil {
+		b.Config = map[string]string{}
+	}
+	switch r.Method {
+	case http.MethodPut:
+		body, err := readBody(r)
+		if err != nil {
+			s3Err(w, 400, "IncompleteBody", err.Error(), "/"+b.Name)
+			return
+		}
+		doc := strings.TrimPrefix(strings.TrimSpace(string(body)), xml.Header)
+		doc = strings.TrimSpace(strings.TrimPrefix(doc, `<?xml version="1.0" encoding="UTF-8"?>`))
+		if sub == "policy" {
+			var p any
+			if json.Unmarshal(body, &p) != nil {
+				s3Err(w, 400, "MalformedPolicy", "Policies must be valid JSON and the first byte must be '{'", "/"+b.Name)
+				return
+			}
+		}
+		if sub == "acl" && doc == "" {
+			doc = a.s3ACL() // canned ACL (x-amz-acl): the owner keeps full control
+		}
+		if sub == "object-lock" {
+			b.ObjectLock = true
+		}
+		if sub == "lifecycle" {
+			size := r.Header.Get("x-amz-transition-default-minimum-object-size")
+			if size == "" {
+				size = "all_storage_classes_128K"
+			}
+			b.Config["lifecycle.minsize"] = size
+			w.Header().Set("x-amz-transition-default-minimum-object-size", size)
+		}
+		b.Config[sub] = doc
+		_ = a.db.put("bucket", b.Name, b)
+		w.WriteHeader(200)
+	case http.MethodGet:
+		doc, ok := b.Config[sub]
+		switch {
+		case ok:
+		case sub == "acl":
+			doc = a.s3ACL()
+		case sub == "object-lock" && b.ObjectLock:
+			doc = "<ObjectLockConfiguration " + s3ns + "><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
+		case def != "":
+			doc = def
+		default:
+			s3Err(w, 404, code, msg, "/"+b.Name)
+			return
+		}
+		if sub == "lifecycle" && b.Config["lifecycle.minsize"] != "" {
+			w.Header().Set("x-amz-transition-default-minimum-object-size", b.Config["lifecycle.minsize"])
+		}
+		if sub == "policy" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("x-amz-request-id", strings.ToUpper(randHex(8)))
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, doc)
+			return
+		}
+		writeXML(w, 200, doc)
+	case http.MethodDelete:
+		delete(b.Config, sub)
+		delete(b.Config, sub+".minsize")
+		_ = a.db.put("bucket", b.Name, b)
+		w.WriteHeader(204)
+	default:
+		s3Err(w, 405, "MethodNotAllowed", "The specified method is not allowed against this resource.", "/"+b.Name)
 	}
 }
 
@@ -277,7 +491,17 @@ func readBody(r *http.Request) ([]byte, error) {
 
 func metaFrom(h http.Header) objMeta {
 	m := objMeta{ContentType: h.Get("Content-Type"), ContentEncoding: strings.TrimSpace(strings.ReplaceAll(h.Get("Content-Encoding"), "aws-chunked", "")),
-		ContentDisposition: h.Get("Content-Disposition"), CacheControl: h.Get("Cache-Control"), User: map[string]string{}}
+		ContentDisposition: h.Get("Content-Disposition"), CacheControl: h.Get("Cache-Control"), ContentLanguage: h.Get("Content-Language"),
+		Expires: h.Get("Expires"), StorageClass: h.Get("x-amz-storage-class"), SSE: h.Get("x-amz-server-side-encryption"),
+		SSEKMSKeyID: h.Get("x-amz-server-side-encryption-aws-kms-key-id"), WebsiteRedirect: h.Get("x-amz-website-redirect-location"),
+		User: map[string]string{}}
+	if t := h.Get("x-amz-tagging"); t != "" {
+		vals, _ := url.ParseQuery(t)
+		m.Tags = map[string]string{}
+		for k := range vals {
+			m.Tags[k] = vals.Get(k)
+		}
+	}
 	m.ContentEncoding = strings.Trim(m.ContentEncoding, ", ")
 	if m.ContentType == "" {
 		m.ContentType = "binary/octet-stream"
@@ -324,6 +548,20 @@ func (a *App) s3Put(w http.ResponseWriter, r *http.Request, b Bucket, key string
 	body, err := readBody(r)
 	if err != nil {
 		s3Err(w, 400, "IncompleteBody", err.Error(), "/"+b.Name+"/"+key)
+		return
+	}
+	// conditional writes (the S3 backend's lock file relies on If-None-Match: *)
+	if cur, ok := a.s3Latest(b.Name, key); ok && !cur.DeleteMarker {
+		if r.Header.Get("If-None-Match") == "*" {
+			s3Err(w, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", "/"+b.Name+"/"+key)
+			return
+		}
+		if im := r.Header.Get("If-Match"); im != "" && strings.Trim(im, `"`) != cur.ETag {
+			s3Err(w, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", "/"+b.Name+"/"+key)
+			return
+		}
+	} else if r.Header.Get("If-Match") != "" {
+		s3Err(w, 404, "NoSuchKey", "The specified key does not exist.", "/"+b.Name+"/"+key)
 		return
 	}
 	if want := r.Header.Get("Content-MD5"); want != "" {
@@ -453,7 +691,20 @@ func (a *App) s3Get(w http.ResponseWriter, r *http.Request, b Bucket, key, vid s
 		h.Set("x-amz-version-id", o.VersionID)
 	}
 	h.Set("Content-Type", o.Meta.ContentType)
-	for k, v := range map[string]string{"Content-Encoding": o.Meta.ContentEncoding, "Content-Disposition": o.Meta.ContentDisposition, "Cache-Control": o.Meta.CacheControl} {
+	sse := o.Meta.SSE
+	if sse == "" {
+		sse = "AES256" // S3 encrypts every object at rest by default
+	}
+	if len(o.Meta.Tags) > 0 {
+		h.Set("x-amz-tagging-count", strconv.Itoa(len(o.Meta.Tags)))
+	}
+	if o.Meta.StorageClass != "" && o.Meta.StorageClass != "STANDARD" {
+		h.Set("x-amz-storage-class", o.Meta.StorageClass)
+	}
+	for k, v := range map[string]string{"Content-Encoding": o.Meta.ContentEncoding, "Content-Disposition": o.Meta.ContentDisposition,
+		"Cache-Control": o.Meta.CacheControl, "Content-Language": o.Meta.ContentLanguage, "Expires": o.Meta.Expires,
+		"x-amz-server-side-encryption": sse, "x-amz-server-side-encryption-aws-kms-key-id": o.Meta.SSEKMSKeyID,
+		"x-amz-website-redirect-location": o.Meta.WebsiteRedirect} {
 		if v != "" {
 			h.Set(k, v)
 		}
@@ -734,6 +985,141 @@ func (a *App) s3ListVersions(w http.ResponseWriter, b Bucket, q url.Values) {
 	}
 	sb.WriteString("</ListVersionsResult>")
 	writeXML(w, 200, sb.String())
+}
+
+// ── S3 Control tagging (/v20180820/tags/<arn>) ──────────────────────────
+// Terraform reads and writes bucket tags through S3 Control. For buckets they are the
+// same tags GetBucketTagging / PutBucketTagging see; other ARNs use the common store.
+// S3 Control prefixes the host with the account id (000000000000.localhost), which
+// clients reach through localaws as an HTTP proxy (see README, Terraform).
+func (a *App) bucketTags(b Bucket) map[string]string {
+	out := map[string]string{}
+	var t s3Tagging
+	if xml.Unmarshal([]byte(b.Config["tagging"]), &t) == nil {
+		for _, tg := range t.TagSet.Tag {
+			out[tg.Key] = tg.Value
+		}
+	}
+	return out
+}
+
+func (a *App) setBucketTags(b Bucket, tags map[string]string) {
+	if b.Config == nil {
+		b.Config = map[string]string{}
+	}
+	if len(tags) == 0 {
+		delete(b.Config, "tagging")
+	} else {
+		var sb strings.Builder
+		sb.WriteString("<Tagging " + s3ns + "><TagSet>")
+		for _, k := range sortedKeys(tags) {
+			sb.WriteString("<Tag><Key>" + xe(k) + "</Key><Value>" + xe(tags[k]) + "</Value></Tag>")
+		}
+		sb.WriteString("</TagSet></Tagging>")
+		b.Config["tagging"] = sb.String()
+	}
+	_ = a.db.put("bucket", b.Name, b)
+}
+
+func (a *App) s3Control(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v20180820/")
+	if !strings.HasPrefix(rest, "tags/") {
+		s3Err(w, 501, "NotImplemented", "localaws s3control: "+r.Method+" /v20180820/"+rest+" is not implemented", "")
+		return
+	}
+	arn := strings.TrimPrefix(rest, "tags/")
+	var b Bucket
+	isBucket := strings.HasPrefix(arn, "arn:aws:s3:::")
+	if isBucket && !a.db.get("bucket", strings.TrimPrefix(arn, "arn:aws:s3:::"), &b) {
+		s3Err(w, 404, "NoSuchBucket", "The specified bucket does not exist", arn)
+		return
+	}
+	tags := a.tagsOf(arn)
+	if isBucket {
+		tags = a.bucketTags(b)
+	}
+	switch r.Method {
+	case http.MethodGet:
+		var sb strings.Builder
+		for _, k := range sortedKeys(tags) {
+			sb.WriteString("<Tag><Key>" + xe(k) + "</Key><Value>" + xe(tags[k]) + "</Value></Tag>")
+		}
+		writeXML(w, 200, `<ListTagsForResourceResult xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/"><Tags>`+sb.String()+"</Tags></ListTagsForResourceResult>")
+		return
+	case http.MethodPost:
+		body, _ := readBody(r)
+		var req struct {
+			Tags struct{ Tag []struct{ Key, Value string } }
+		}
+		if err := xml.Unmarshal(body, &req); err != nil {
+			s3Err(w, 400, "MalformedXML", err.Error(), arn)
+			return
+		}
+		for _, t := range req.Tags.Tag {
+			tags[t.Key] = t.Value
+		}
+	case http.MethodDelete:
+		for _, k := range r.URL.Query()["tagKeys"] {
+			delete(tags, k)
+		}
+	}
+	if isBucket {
+		a.setBucketTags(b, tags)
+	} else {
+		_ = a.db.put("tags", arn, tags)
+	}
+	w.WriteHeader(map[string]int{http.MethodPost: 200, http.MethodDelete: 204}[r.Method])
+}
+
+// ── object tagging ───────────────────────────────────────────────────────
+type s3Tagging struct {
+	TagSet struct {
+		Tag []struct{ Key, Value string }
+	}
+}
+
+func (a *App) s3ObjectTagging(w http.ResponseWriter, r *http.Request, b Bucket, key, vid string) {
+	res := "/" + b.Name + "/" + key
+	var o s3Object
+	var ok bool
+	if vid != "" {
+		o, ok = a.s3Version(b.Name, key, vid)
+	} else {
+		o, ok = a.s3Latest(b.Name, key)
+	}
+	if !ok || o.DeleteMarker {
+		s3Err(w, 404, "NoSuchKey", "The specified key does not exist.", res)
+		return
+	}
+	if vid != "" || b.Versioning != "" {
+		w.Header().Set("x-amz-version-id", o.VersionID)
+	}
+	switch r.Method {
+	case http.MethodGet:
+		var sb strings.Builder
+		sb.WriteString("<Tagging " + s3ns + "><TagSet>")
+		for _, k := range sortedKeys(o.Meta.Tags) {
+			sb.WriteString("<Tag><Key>" + xe(k) + "</Key><Value>" + xe(o.Meta.Tags[k]) + "</Value></Tag>")
+		}
+		sb.WriteString("</TagSet></Tagging>")
+		writeXML(w, 200, sb.String())
+		return
+	case http.MethodPut:
+		body, _ := readBody(r)
+		var t s3Tagging
+		if err := xml.Unmarshal(body, &t); err != nil {
+			s3Err(w, 400, "MalformedXML", err.Error(), res)
+			return
+		}
+		o.Meta.Tags = map[string]string{}
+		for _, tg := range t.TagSet.Tag {
+			o.Meta.Tags[tg.Key] = tg.Value
+		}
+	case http.MethodDelete:
+		o.Meta.Tags = nil
+	}
+	_ = a.db.exec(`UPDATE s3_objects SET meta=? WHERE bucket=? AND key=? AND version_id=?`, jsonStr(o.Meta), b.Name, key, o.VersionID)
+	w.WriteHeader(map[string]int{http.MethodPut: 200, http.MethodDelete: 204}[r.Method])
 }
 
 // ── multipart ────────────────────────────────────────────────────────────

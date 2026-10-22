@@ -16,7 +16,11 @@ type LogGroup struct {
 	Name      string `json:"name"`
 	Created   int64  `json:"created"`
 	Retention int    `json:"retention,omitempty"`
+	KmsKeyID  string `json:"kmsKeyId,omitempty"`
+	Class     string `json:"class,omitempty"`
 }
+
+func (a *App) logGroupArn(g string) string { return a.arn("logs", "log-group:"+g) }
 
 type LogStream struct {
 	Group   string `json:"group"`
@@ -157,13 +161,15 @@ func (a *App) logsAPI(op string, in M) (any, *apiError) {
 		if a.groupExists(group) {
 			return nil, errf(400, "ResourceAlreadyExistsException", "The specified log group already exists")
 		}
-		a.ensureGroup(group)
+		_ = a.db.put("loggroup", group, LogGroup{Name: group, Created: nowMs(), KmsKeyID: getStr(in, "kmsKeyId"), Class: getStr(in, "logGroupClass")})
+		a.tagResource(a.logGroupArn(group), mapStr(getMap(in, "tags")))
 		return M{}, nil
 	case "DeleteLogGroup":
 		if !a.groupExists(group) {
 			return nil, notFound
 		}
 		_ = a.db.del("loggroup", group)
+		a.untagAll(a.logGroupArn(group))
 		_ = a.db.exec(`DELETE FROM log_events WHERE grp=?`, group)
 		_ = a.db.exec(`DELETE FROM resources WHERE kind='logstream' AND id LIKE ?`, group+"\x00%")
 		return M{}, nil
@@ -185,6 +191,12 @@ func (a *App) logsAPI(op string, in M) (any, *apiError) {
 				"arn": a.arn("logs", "log-group:"+g.Name+":*"), "logGroupArn": a.arn("logs", "log-group:"+g.Name), "logGroupClass": "STANDARD"}
 			if g.Retention > 0 {
 				m["retentionInDays"] = g.Retention
+			}
+			if g.KmsKeyID != "" {
+				m["kmsKeyId"] = g.KmsKeyID
+			}
+			if g.Class != "" {
+				m["logGroupClass"] = g.Class
 			}
 			out = append(out, m)
 		}
@@ -374,10 +386,34 @@ func (a *App) logsAPI(op string, in M) (any, *apiError) {
 			resp["nextToken"] = strconv.FormatInt(last, 10)
 		}
 		return resp, nil
-	case "TagLogGroup", "TagResource", "UntagResource":
+	case "AssociateKmsKey", "DisassociateKmsKey":
+		var g LogGroup
+		if !a.db.get("loggroup", group, &g) {
+			return nil, notFound
+		}
+		g.KmsKeyID = getStr(in, "kmsKeyId")
+		_ = a.db.put("loggroup", group, g)
 		return M{}, nil
-	case "ListTagsLogGroup", "ListTagsForResource":
-		return M{"tags": M{}}, nil
+	case "TagLogGroup":
+		a.tagResource(a.logGroupArn(group), mapStr(getMap(in, "tags")))
+		return M{}, nil
+	case "UntagLogGroup":
+		a.untagResource(a.logGroupArn(group), strList(getList(in, "tags")))
+		return M{}, nil
+	case "TagResource":
+		a.tagResource(strings.TrimSuffix(getStr(in, "resourceArn"), ":*"), mapStr(getMap(in, "tags")))
+		return M{}, nil
+	case "UntagResource":
+		a.untagResource(strings.TrimSuffix(getStr(in, "resourceArn"), ":*"), strList(getList(in, "tagKeys")))
+		return M{}, nil
+	case "ListTagsLogGroup":
+		return M{"tags": a.tagsOf(a.logGroupArn(group))}, nil
+	case "ListTagsForResource":
+		return M{"tags": a.tagsOf(strings.TrimSuffix(getStr(in, "resourceArn"), ":*"))}, nil
+	case "DescribeMetricFilters":
+		return M{"metricFilters": []any{}}, nil
+	case "DescribeSubscriptionFilters":
+		return M{"subscriptionFilters": []any{}}, nil
 	}
 	return nil, errf(400, "UnknownOperationException", "localaws logs: %s is not implemented", op)
 }

@@ -7,6 +7,7 @@ package main
 // rule; matching targets receive it (Input / InputPath / InputTransformer applied):
 //   arn:aws:states:…:stateMachine:<name>   StartExecution (name <event id>_<uuid>)
 //   arn:aws:logs:…:log-group:<name>        one log event per delivery
+//   arn:aws:sqs:…:<name>                   SendMessage (body = the input)
 // Other target types are accepted and reported as undeliverable in the server log.
 
 import (
@@ -16,7 +17,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -50,6 +50,49 @@ type Target struct {
 	Input            string            `json:"Input,omitempty"`
 	InputPath        string            `json:"InputPath,omitempty"`
 	InputTransformer *InputTransformer `json:"InputTransformer,omitempty"`
+	SqsParameters    struct {
+		MessageGroupId string `json:"MessageGroupId,omitempty"`
+	} `json:"SqsParameters,omitempty"`
+	Extra M `json:"-"` // every other field (EcsParameters, RetryPolicy, DeadLetterConfig, …), kept as sent
+}
+
+type targetFields Target
+
+// MarshalJSON / UnmarshalJSON keep the fields this emulator does not act on, so a
+// target reads back exactly as it was put.
+func (t Target) MarshalJSON() ([]byte, error) {
+	b, err := json.Marshal(targetFields(t))
+	if err != nil {
+		return b, err
+	}
+	m := M{}
+	_ = json.Unmarshal(b, &m)
+	if sp, ok := m["SqsParameters"].(map[string]any); ok && len(sp) == 0 {
+		delete(m, "SqsParameters")
+	}
+	for k, v := range t.Extra {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
+	return json.Marshal(m)
+}
+
+func (t *Target) UnmarshalJSON(b []byte) error {
+	var f targetFields
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	m := M{}
+	_ = json.Unmarshal(b, &m)
+	for _, k := range []string{"Id", "Arn", "RoleArn", "Input", "InputPath", "InputTransformer", "SqsParameters"} {
+		delete(m, k)
+	}
+	if len(m) > 0 {
+		f.Extra = m
+	}
+	*t = Target(f)
+	return nil
 }
 
 type Rule struct {
@@ -58,6 +101,7 @@ type Rule struct {
 	ScheduleExpression string   `json:"ScheduleExpression,omitempty"`
 	State              string   `json:"State"`
 	Description        string   `json:"Description,omitempty"`
+	RoleArn            string   `json:"RoleArn,omitempty"`
 	Targets            []Target `json:"Targets"`
 }
 
@@ -74,8 +118,10 @@ func (a *App) putRule(r Rule) error {
 		}
 	}
 	if r.ScheduleExpression != "" {
-		if _, ok := parseRate(r.ScheduleExpression); !ok {
-			return errf(400, "ValidationException", "Parameter ScheduleExpression is not valid (localaws supports rate() expressions).")
+		_, rateOK := parseRate(r.ScheduleExpression)
+		_, cronErr := parseCron(r.ScheduleExpression)
+		if !rateOK && cronErr != nil {
+			return errf(400, "ValidationException", "Parameter ScheduleExpression is not valid.")
 		}
 	}
 	if r.State == "" {
@@ -116,23 +162,60 @@ func (a *App) deliver(r Rule, eventID string, doc M) {
 			a.logf("events %s → %s: input transform failed: %v", r.Name, t.Id, err)
 			continue
 		}
-		svc := strings.Split(t.Arn, ":")
-		switch {
-		case len(svc) > 5 && svc[2] == "states":
-			name := eventID + "_" + uuid4()
-			if _, e := a.startExecution(arnTail(t.Arn), name, input); e != nil {
-				a.logf("events %s → %s: %v", r.Name, t.Arn, e)
-			} else {
-				a.logf("events %s → state machine %s (execution %s)", r.Name, arnTail(t.Arn), name)
-			}
-		case len(svc) > 5 && svc[2] == "logs":
-			group := strings.TrimSuffix(strings.TrimPrefix(strings.Join(svc[5:], ":"), "log-group:"), ":*")
-			a.ensureGroup(group)
-			a.ensureStream(group, eventID)
-			a.appendLog(group, eventID, input)
-		default:
-			a.logf("events %s → %s: target type not emulated — event dropped", r.Name, t.Arn)
+		a.deliverTarget(r.Name, t, eventID, input)
+	}
+}
+
+// deliverTarget hands one input to one target (rules and Scheduler schedules alike).
+func (a *App) deliverTarget(from string, t Target, eventID, input string) {
+	svc := strings.Split(t.Arn, ":")
+	switch {
+	case len(svc) > 5 && svc[2] == "states":
+		name := eventID + "_" + uuid4()
+		if _, e := a.startExecution(arnTail(t.Arn), name, input); e != nil {
+			a.logf("events %s → %s: %v", from, t.Arn, e)
+		} else {
+			a.logf("events %s → state machine %s (execution %s)", from, arnTail(t.Arn), name)
 		}
+	case len(svc) > 5 && svc[2] == "sqs":
+		q, e := a.queue(svc[5])
+		if e == nil {
+			_, e = a.sendMessage(q, input, -1, nil, t.SqsParameters.MessageGroupId, "")
+		}
+		if e != nil {
+			a.logf("events %s → %s: %v", from, t.Arn, e)
+		} else {
+			a.logf("events %s → queue %s", from, svc[5])
+		}
+	case len(svc) > 5 && svc[2] == "ecs":
+		ep := getMap(t.Extra, "EcsParameters")
+		req := M{"cluster": arnTail(t.Arn), "taskDefinition": getStr(ep, "TaskDefinitionArn"), "launchType": getStr(ep, "LaunchType"), "group": getStr(ep, "Group"), "networkConfiguration": camelize(getMap(ep, "NetworkConfiguration"))}
+		var ov M // an explicit input is the task's overrides, as on AWS
+		explicit := t.Input != "" || t.InputPath != "" || t.InputTransformer != nil
+		if explicit && json.Unmarshal([]byte(input), &ov) == nil {
+			req["overrides"] = ov
+		}
+		for i := 0; i < getInt(ep, "TaskCount", 1); i++ {
+			if tk, e := a.runTask(req, "events-rule/"+from, ""); e != nil {
+				a.logf("events %s → %s: %s", from, t.Arn, e.Msg)
+				break
+			} else {
+				a.logf("events %s → ecs task %s", from, tk.ID)
+			}
+		}
+	case len(svc) > 5 && svc[2] == "sns":
+		if !a.db.has("topic", svc[5]) {
+			a.logf("events %s → %s: topic does not exist", from, t.Arn)
+			return
+		}
+		a.recordSNS(svc[5], "", input, nil, t.SqsParameters.MessageGroupId, "")
+	case len(svc) > 5 && svc[2] == "logs":
+		group := strings.TrimSuffix(strings.TrimPrefix(strings.Join(svc[5:], ":"), "log-group:"), ":*")
+		a.ensureGroup(group)
+		a.ensureStream(group, eventID)
+		a.appendLog(group, eventID, input)
+	default:
+		a.logf("events %s → %s: target type not emulated — event dropped", from, t.Arn)
 	}
 }
 
@@ -191,9 +274,10 @@ func parseRate(expr string) (time.Duration, bool) {
 	return time.Duration(n) * unit, n > 0
 }
 
+// scheduler fires schedule-driven work once a second: rules with rate() / cron()
+// expressions (UTC, as on AWS) and EventBridge Scheduler schedules.
 func (a *App) scheduler(stop <-chan struct{}) {
-	last := map[string]time.Time{}
-	var mu sync.Mutex
+	f := &firing{last: map[string]time.Time{}}
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -202,31 +286,14 @@ func (a *App) scheduler(stop <-chan struct{}) {
 			return
 		case now := <-tick.C:
 			for _, r := range list[Rule](a.db, "rule") {
-				if r.State != "ENABLED" || r.ScheduleExpression == "" {
+				if r.State != "ENABLED" || r.ScheduleExpression == "" || !f.due("rule:"+r.Name, r.ScheduleExpression, now, time.UTC, 0) {
 					continue
 				}
-				every, ok := parseRate(r.ScheduleExpression)
-				if !ok {
-					continue
-				}
-				mu.Lock()
-				prev, seen := last[r.Name]
-				if !seen {
-					last[r.Name] = now
-					mu.Unlock()
-					continue
-				}
-				due := now.Sub(prev) >= every
-				if due {
-					last[r.Name] = now
-				}
-				mu.Unlock()
-				if due {
-					e := Event{ID: uuid4(), Source: "aws.events", DetailType: "Scheduled Event", Detail: M{},
-						Resources: []string{a.ruleArn(r.Name)}, Time: now.UnixMilli()}
-					a.deliver(r, e.ID, a.eventDoc(e))
-				}
+				e := Event{ID: uuid4(), Source: "aws.events", DetailType: "Scheduled Event", Detail: M{},
+					Resources: []string{a.ruleArn(r.Name)}, Time: now.UnixMilli()}
+				a.deliver(r, e.ID, a.eventDoc(e))
 			}
+			a.fireSchedules(f, now)
 		}
 	}
 }
@@ -412,7 +479,10 @@ func wildcard(pattern, s string) bool {
 
 // ── API ──────────────────────────────────────────────────────────────────
 func (a *App) ruleOut(r Rule) M {
-	m := M{"Name": r.Name, "Arn": a.ruleArn(r.Name), "State": r.State, "EventBusName": "default"}
+	m := M{"Name": r.Name, "Arn": a.ruleArn(r.Name), "State": r.State, "EventBusName": "default", "CreatedBy": a.cfg.Account}
+	if r.RoleArn != "" {
+		m["RoleArn"] = r.RoleArn
+	}
 	if r.EventPattern != "" {
 		m["EventPattern"] = r.EventPattern
 	}
@@ -436,13 +506,17 @@ func (a *App) eventsAPI(op string, in M) (any, *apiError) {
 	switch op {
 	case "PutRule":
 		r := Rule{Name: getStr(in, "Name"), EventPattern: getStr(in, "EventPattern"), ScheduleExpression: getStr(in, "ScheduleExpression"),
-			State: getStr(in, "State"), Description: getStr(in, "Description")}
+			State: getStr(in, "State"), Description: getStr(in, "Description"), RoleArn: getStr(in, "RoleArn")}
+		if bus := getStr(in, "EventBusName"); bus != "" && arnTail(bus) != "default" {
+			return nil, errf(400, "ResourceNotFoundException", "Event bus %s does not exist.", bus)
+		}
 		if err := a.putRule(r); err != nil {
 			if ae, ok := err.(*apiError); ok {
 				return nil, ae
 			}
 			return nil, errf(500, "InternalException", "%v", err)
 		}
+		a.tagResource(a.ruleArn(r.Name), tagsFromList(getList(in, "Tags"), "Key", "Value"))
 		return M{"RuleArn": a.ruleArn(r.Name)}, nil
 	case "DescribeRule":
 		r, e := getRule(getStr(in, "Name"))
@@ -483,6 +557,7 @@ func (a *App) eventsAPI(op string, in M) (any, *apiError) {
 			return nil, errf(400, "ValidationException", "Rule can't be deleted since it has targets.")
 		}
 		_ = a.db.del("rule", r.Name)
+		a.untagAll(a.ruleArn(r.Name))
 		return M{}, nil
 	case "EnableRule", "DisableRule":
 		r, e := getRule(getStr(in, "Name"))
@@ -568,6 +643,14 @@ func (a *App) eventsAPI(op string, in M) (any, *apiError) {
 			return nil, errf(400, "ValidationException", "Parameter Event is not valid. Reason: %v", err)
 		}
 		return M{"Result": matchPattern(pat, ev)}, nil
+	case "TagResource":
+		a.tagResource(getStr(in, "ResourceARN"), tagsFromList(getList(in, "Tags"), "Key", "Value"))
+		return M{}, nil
+	case "UntagResource":
+		a.untagResource(getStr(in, "ResourceARN"), strList(getList(in, "TagKeys")))
+		return M{}, nil
+	case "ListTagsForResource":
+		return M{"Tags": tagList(a.tagsOf(getStr(in, "ResourceARN")), "Key", "Value")}, nil
 	case "ListEventBuses":
 		return M{"EventBuses": []any{M{"Name": "default", "Arn": a.arn("events", "event-bus/default")}}}, nil
 	case "DescribeEventBus":

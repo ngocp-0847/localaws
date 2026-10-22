@@ -30,6 +30,9 @@ type StateMachine struct {
 	Definition string `json:"definition"`
 	Created    int64  `json:"created"`
 	Updated    int64  `json:"updated"`
+	Logging    M      `json:"logging,omitempty"`
+	Tracing    M      `json:"tracing,omitempty"`
+	Encryption M      `json:"encryption,omitempty"`
 }
 
 type Execution struct {
@@ -688,8 +691,28 @@ func (r *run) task(name string, st map[string]any, params any, prev int64) (any,
 		}
 		return succeeded(M{"Entries": entries, "FailedEntryCount": 0}, startedID)
 	case svc == "sns" && action == "publish":
-		r.a.logf("states %s: sns:publish to %s accepted (not delivered)", r.e.Name, str(pm["TopicArn"]))
-		return succeeded(M{"MessageId": uuid4()}, startedID)
+		msg := pm["Message"]
+		if _, isStr := msg.(string); !isStr {
+			msg = jsonStr(msg)
+		}
+		attrs, _ := pm["MessageAttributes"].(map[string]any)
+		id := r.a.recordSNS(arnTail(str(pm["TopicArn"])), str(pm["Subject"]), str(msg), attrs, str(pm["MessageGroupId"]), str(pm["MessageDeduplicationId"]))
+		return succeeded(M{"MessageId": id}, startedID)
+	case svc == "sqs" && action == "sendMessage":
+		q, e := r.a.queue(str(pm["QueueUrl"]))
+		if e != nil {
+			return failed(&stateErr{"SQS.QueueDoesNotExistException", e.Msg, true}, startedID)
+		}
+		body := pm["MessageBody"]
+		if _, isStr := body.(string); !isStr {
+			body = jsonStr(body)
+		}
+		attrs, _ := pm["MessageAttributes"].(map[string]any)
+		res, e := r.a.sendMessage(q, str(body), getInt(pm, "DelaySeconds", -1), attrs, str(pm["MessageGroupId"]), str(pm["MessageDeduplicationId"]))
+		if e != nil {
+			return failed(&stateErr{"SQS." + e.Type, e.Msg, true}, startedID)
+		}
+		return succeeded(res, startedID)
 	}
 	return failed(&stateErr{"States.Runtime", fmt.Sprintf("localaws: the resource %s is not emulated", resource), false}, startedID)
 }
@@ -779,16 +802,27 @@ func (a *App) history(arn string) []M {
 }
 
 func (a *App) smOut(sm StateMachine) M {
+	logging, tracing, enc := sm.Logging, sm.Tracing, sm.Encryption
+	if len(logging) == 0 {
+		logging = M{"level": "OFF", "includeExecutionData": false}
+	}
+	if len(tracing) == 0 {
+		tracing = M{"enabled": false}
+	}
+	if len(enc) == 0 {
+		enc = M{"type": "AWS_OWNED_KEY"}
+	}
 	return M{"stateMachineArn": sm.Arn, "name": sm.Name, "status": "ACTIVE", "definition": sm.Definition, "roleArn": sm.RoleArn,
-		"type": sm.Type, "creationDate": epoch(sm.Created), "loggingConfiguration": M{"level": "OFF", "includeExecutionData": false},
-		"tracingConfiguration": M{"enabled": false}, "revisionId": fmt.Sprint(sm.Updated)}
+		"type": sm.Type, "creationDate": epoch(sm.Created), "loggingConfiguration": logging, "tracingConfiguration": tracing,
+		"encryptionConfiguration": enc, "revisionId": fmt.Sprint(sm.Updated)}
 }
 
 func (a *App) sfnAPI(op string, in M) (any, *apiError) {
 	switch op {
 	case "CreateStateMachine":
 		def := getStr(in, "definition")
-		sm := StateMachine{Name: getStr(in, "name"), Type: getStr(in, "type"), RoleArn: getStr(in, "roleArn"), Definition: def}
+		sm := StateMachine{Name: getStr(in, "name"), Type: getStr(in, "type"), RoleArn: getStr(in, "roleArn"), Definition: def,
+			Logging: getMap(in, "loggingConfiguration"), Tracing: getMap(in, "tracingConfiguration"), Encryption: getMap(in, "encryptionConfiguration")}
 		var old StateMachine
 		if a.db.get("statemachine", sm.Name, &old) {
 			if old.Definition == def && old.RoleArn == sm.RoleArn {
@@ -800,6 +834,7 @@ func (a *App) sfnAPI(op string, in M) (any, *apiError) {
 			return nil, e
 		}
 		sm, _ = a.getSM(sm.Name)
+		a.tagResource(sm.Arn, tagsFromList(getList(in, "tags"), "key", "value"))
 		return M{"stateMachineArn": sm.Arn, "creationDate": epoch(sm.Created)}, nil
 	case "UpdateStateMachine":
 		sm, e := a.getSM(getStr(in, "stateMachineArn"))
@@ -812,12 +847,22 @@ func (a *App) sfnAPI(op string, in M) (any, *apiError) {
 		if ra := getStr(in, "roleArn"); ra != "" {
 			sm.RoleArn = ra
 		}
+		if _, ok := in["loggingConfiguration"]; ok {
+			sm.Logging = getMap(in, "loggingConfiguration")
+		}
+		if _, ok := in["tracingConfiguration"]; ok {
+			sm.Tracing = getMap(in, "tracingConfiguration")
+		}
+		if _, ok := in["encryptionConfiguration"]; ok {
+			sm.Encryption = getMap(in, "encryptionConfiguration")
+		}
 		if e := a.createStateMachine(sm); e != nil {
 			return nil, e
 		}
 		return M{"updateDate": epoch(nowMs())}, nil
 	case "DeleteStateMachine":
 		_ = a.db.del("statemachine", arnTail(getStr(in, "stateMachineArn")))
+		a.untagAll(a.smArn(arnTail(getStr(in, "stateMachineArn"))))
 		return M{}, nil
 	case "DescribeStateMachine":
 		sm, e := a.getSM(getStr(in, "stateMachineArn"))
@@ -942,10 +987,16 @@ func (a *App) sfnAPI(op string, in M) (any, *apiError) {
 			e = a.waitExecution(context.Background(), arn)
 		}
 		return M{"stopDate": epoch(e.Stop)}, nil
-	case "TagResource", "UntagResource":
+	case "TagResource":
+		a.tagResource(getStr(in, "resourceArn"), tagsFromList(getList(in, "tags"), "key", "value"))
+		return M{}, nil
+	case "UntagResource":
+		a.untagResource(getStr(in, "resourceArn"), strList(getList(in, "tagKeys")))
 		return M{}, nil
 	case "ListTagsForResource":
-		return M{"tags": []any{}}, nil
+		return M{"tags": tagList(a.tagsOf(getStr(in, "resourceArn")), "key", "value")}, nil
+	case "ListStateMachineVersions", "ListStateMachineAliases":
+		return M{"stateMachineVersions": []any{}, "stateMachineAliases": []any{}}, nil
 	}
 	return nil, errf(400, "UnknownOperationException", "localaws states: %s is not implemented", op)
 }

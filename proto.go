@@ -213,3 +213,8 @@ func queryErr(w http.ResponseWriter, e *apiError) {
 	writeXML(w, e.Status, "<ErrorResponse><Error><Type>Sender</Type><Code>"+e.Type+"</Code><Message>"+
 		xe(e.Msg)+"</Message></Error><RequestId>"+uuid4()+"</RequestId></ErrorResponse>")
 }
+
+// ec2Error: EC2's own Query error shape (<Response><Errors>…).
+func ec2Error(w http.ResponseWriter, e *apiError) {
+	writeXML(w, e.Status, "<Response><Errors><Error><Code>"+e.Type+"</Code><Message>"+xe(e.Msg)+"</Message></Error></Errors><RequestID>"+uuid4()+"</RequestID></Response>")
+}

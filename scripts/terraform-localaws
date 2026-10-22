@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# terraform-localaws — run terraform against localaws, without editing the module.
+#
+#   terraform-localaws [-chdir=DIR] init|plan|apply|destroy|… [args]
+#
+# Before each run it (re)writes DIR/localaws_override.tf with `localaws terraform-override`:
+# every provider "aws" (and alias) → localaws, backend → localaws's S3 when the module
+# uses an s3 backend (the state bucket is created). The file is removed afterwards unless
+# it was there before or LOCALAWS_KEEP_OVERRIDE=1.
+#
+#   LOCALAWS_ENDPOINT  where localaws listens            (default http://localhost:4566)
+#   LOCALAWS_BACKEND   auto | local | s3 | keep          (default auto)
+#   LOCALAWS_BIN       the localaws binary               (default: next to this script, then PATH)
+#   TERRAFORM          the terraform binary              (default terraform; tofu works too)
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bin="${LOCALAWS_BIN:-}"
+if [[ -z "$bin" ]]; then
+  if [[ -x "$here/../localaws" ]]; then bin="$here/../localaws"; else bin="$(command -v localaws || true)"; fi
+fi
+[[ -n "$bin" ]] || { echo "terraform-localaws: localaws binary not found (set LOCALAWS_BIN)" >&2; exit 1; }
+tf="${TERRAFORM:-terraform}"
+endpoint="${LOCALAWS_ENDPOINT:-http://localhost:4566}"
+
+dir="."
+for a in "$@"; do
+  case "$a" in -chdir=*) dir="${a#-chdir=}" ;; esac
+done
+override="$dir/localaws_override.tf"
+existed=0; [[ -f "$override" ]] && existed=1
+
+curl -fsS -o /dev/null "$endpoint/_localaws/health" ||
+  { echo "terraform-localaws: localaws is not answering at $endpoint (set LOCALAWS_ENDPOINT)" >&2; exit 1; }
+"$bin" terraform-override -dir "$dir" -endpoint "$endpoint" -backend "${LOCALAWS_BACKEND:-auto}" -o localaws_override.tf
+if [[ $existed == 0 && "${LOCALAWS_KEEP_OVERRIDE:-}" != 1 ]]; then
+  trap 'rm -f "$override"' EXIT
+fi
+"$tf" "$@"

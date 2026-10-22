@@ -8,6 +8,7 @@
 //
 //	localaws                                   serve on :4566 (UI at /_localaws/)
 //	localaws -config env.json -runner docker   bring up a declared environment
+//	localaws terraform-override -dir infra     point a Terraform module at it (tfgen.go)
 package main
 
 import (
@@ -48,6 +49,7 @@ type App struct {
 	noops    sync.Map // task id → cancel (runner=noop)
 	apiMu    sync.Mutex
 	apiLog   []apiCall
+	ctl      sync.Mutex // control-plane writes, see serial
 	stop     chan struct{}
 }
 
@@ -156,6 +158,21 @@ func signingService(r *http.Request) string {
 	return ""
 }
 
+// slowOps wait on something (long polling, an execution to finish): they never hold
+// the control-plane lock.
+var slowOps = map[string]bool{"AmazonSQS.ReceiveMessage": true, "AWSStepFunctions.StartSyncExecution": true,
+	"AWSStepFunctions.StopExecution": true, "SynchronousStepFunctions.StartSyncExecution": true}
+
+// serial runs fn holding the control-plane lock. Declarative tools (Terraform first)
+// send many requests at once that read, modify and write the same resource — a bucket's
+// subresources, a role's policies — and would otherwise lose each other's writes.
+// Data-plane calls (objects, messages, log events, executions) do not take it.
+func (a *App) serial(fn func()) {
+	a.ctl.Lock()
+	defer a.ctl.Unlock()
+	fn()
+}
+
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{w, 200}
 	t0 := time.Now()
@@ -173,57 +190,129 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.admin(sw, r)
 		return
 	}
+	if r.Method == http.MethodConnect {
+		// used as an HTTPS proxy (Terraform's https_proxy): nothing may leave for real AWS
+		what = "CONNECT " + r.Host
+		a.logf("blocked an HTTPS request to %s: localaws does not forward to real endpoints — add that service to the endpoints", r.Host)
+		http.Error(sw, "localaws: refusing to tunnel to "+r.Host+" — configure an endpoint for this service", http.StatusForbidden)
+		return
+	}
 	if target := r.Header.Get("X-Amz-Target"); target != "" {
 		svc, op, _ := strings.Cut(target, ".")
 		what = svc + "." + op
 		in := readJSON(r)
-		var out any
-		var e *apiError
-		switch {
-		case strings.HasPrefix(svc, "AWSStepFunctions"):
-			out, e = a.sfnAPI(op, in)
-		case strings.HasPrefix(svc, "AmazonEC2ContainerService"):
-			out, e = a.ecsAPI(op, in)
-		case strings.HasPrefix(svc, "Logs_"):
-			out, e = a.logsAPI(op, in)
-		case strings.HasPrefix(svc, "AmazonSSM"):
-			out, e = a.ssmAPI(op, in)
-		case strings.HasPrefix(svc, "AWSEvents"):
-			out, e = a.eventsAPI(op, in)
-		default:
-			e = errf(400, "UnknownOperationException", "localaws: service %s is not emulated", svc)
+		run := a.serial
+		if slowOps[what] {
+			run = func(fn func()) { fn() }
 		}
+		run(func() { a.jsonAPI(sw, r, svc, op, in) })
+		return
+	}
+	svc := signingService(r)
+	if strings.HasPrefix(r.URL.Path, "/v20180820/") {
+		what = "s3control " + r.Method + " " + r.URL.Path
+		a.serial(func() { a.s3Control(sw, r) })
+		return
+	}
+	if (svc == "ses" || svc == "email") && strings.HasPrefix(r.URL.Path, "/v2/email/") {
+		what = "sesv2 " + r.Method + " " + r.URL.Path
+		a.serial(func() { a.sesV2(sw, r) })
+		return
+	}
+	if rest, ok := a.restAPI(svc, r); ok {
+		what = svc + " " + r.Method + " " + r.URL.Path
+		a.serial(func() { rest(sw, r) })
+		return
+	}
+	if r.Method == http.MethodPost && svc != "s3" && strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		body, _ := io.ReadAll(r.Body)
+		vals, _ := url.ParseQuery(string(body))
+		if act := vals.Get("Action"); act != "" {
+			what = svc + "." + act
+			a.serial(func() {
+				out, e := a.queryAPI(svc, vals)
+				switch {
+				case e != nil && svc == "ec2":
+					ec2Error(sw, e)
+				case e != nil:
+					queryErr(sw, e)
+				default:
+					writeXML(sw, 200, out)
+				}
+			})
+			return
+		}
+	}
+	if svc != "" && !strings.HasPrefix(svc, "s3") {
+		what = svc + " " + r.Method + " " + r.URL.Path
+		writeJSONErr(sw, errf(400, "UnknownOperationException", "localaws: service %s (%s %s) is not emulated", svc, r.Method, r.URL.Path))
+		return
+	}
+	// S3: bucket configuration and object tagging are read-modify-write
+	p := strings.Trim(r.URL.Path, "/")
+	bucketLevel := !strings.Contains(p, "/")
+	if a.bucketFromHost(r.Host) != "" {
+		bucketLevel = p == ""
+	}
+	conditional := r.Method == http.MethodPut && (r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Match") != "") // check-and-write is atomic
+	if bucketLevel || conditional || r.URL.Query().Has("tagging") {
+		a.serial(func() { a.s3(sw, r) })
+		return
+	}
+	a.s3(sw, r)
+}
+
+// jsonAPI serves the AWS JSON protocol services (X-Amz-Target).
+func (a *App) jsonAPI(sw http.ResponseWriter, r *http.Request, svc, op string, in M) {
+	if svc == "AmazonSQS" {
+		out, e := a.sqsAPI(r, op, in)
+		sw.Header().Set("Content-Type", "application/x-amz-json-1.0")
 		if e != nil {
+			sw.Header().Set("x-amzn-query-error", sqsQueryCode(e.Type)+";Sender")
+			e.Type = "com.amazonaws.sqs#" + e.Type
 			writeJSONErr(sw, e)
 			return
 		}
 		writeJSON(sw, 200, out)
 		return
 	}
-	svc := signingService(r)
-	if r.Method == http.MethodPost && svc != "s3" && strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
-		body, _ := io.ReadAll(r.Body)
-		vals, _ := url.ParseQuery(string(body))
-		if act := vals.Get("Action"); act != "" {
-			what = svc + "." + act
-			out, e := a.queryAPI(svc, vals)
-			if e != nil {
-				queryErr(sw, e)
-				return
-			}
-			writeXML(sw, 200, out)
-			return
-		}
+	var out any
+	var e *apiError
+	switch {
+	case strings.HasPrefix(svc, "AWSStepFunctions"), strings.HasPrefix(svc, "SynchronousStepFunctions"):
+		out, e = a.sfnAPI(op, in)
+	case strings.HasPrefix(svc, "AmazonEC2ContainerService"):
+		out, e = a.ecsAPI(op, in)
+	case strings.HasPrefix(svc, "Logs_"):
+		out, e = a.logsAPI(op, in)
+	case strings.HasPrefix(svc, "AmazonSSM"):
+		out, e = a.ssmAPI(op, in)
+	case strings.HasPrefix(svc, "AWSEvents"):
+		out, e = a.eventsAPI(op, in)
+	case svc == "TrentService":
+		out, e = a.kmsAPI(op, in)
+	case svc == "secretsmanager":
+		out, e = a.secretsAPI(op, in)
+	case strings.HasPrefix(svc, "AmazonEC2ContainerRegistry"):
+		out, e = a.ecrAPI(op, in)
+	default:
+		e = errf(400, "UnknownOperationException", "localaws: service %s is not emulated", svc)
 	}
-	a.s3(sw, r)
+	if e != nil {
+		writeJSONErr(sw, e)
+		return
+	}
+	writeJSON(sw, 200, out)
 }
 
 func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 	switch p := strings.TrimPrefix(r.URL.Path, "/_localaws"); {
 	case p == "/health":
 		writeJSON(w, 200, M{"status": "running", "version": version, "runner": a.cfg.Runner.Mode, "account": a.cfg.Account,
-			"region": a.cfg.Region, "services": []string{"s3", "events", "states", "ecs", "logs", "ssm", "sts", "ec2", "sns"}})
+			"region": a.cfg.Region, "services": []string{"s3", "s3control", "events", "scheduler", "states", "ecs", "ecr", "logs", "ssm", "secretsmanager", "kms", "iam", "sts", "ec2", "sns", "sqs", "ses"}})
 	case p == "/reset" && r.Method == http.MethodPost:
+		a.ctl.Lock()
+		defer a.ctl.Unlock()
 		a.runsMu.Lock()
 		for _, rn := range a.runs {
 			rn.cancel()
@@ -249,6 +338,18 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, a.consoleInfo())
 	case p == "/api/calls":
 		writeJSON(w, 200, a.consoleCalls())
+	case p == "/api/ses/messages":
+		a.adminMessages(w, r, "ses")
+	case p == "/api/sns/messages":
+		a.adminMessages(w, r, "sns")
+	case p == "/plugin" || p == "/plugin/" || strings.HasPrefix(p, "/plugin/sections/"):
+		a.pluginHandler(w, r, p)
+	case p == "/api/sqs/messages":
+		limit := atoi(r.URL.Query().Get("limit"))
+		if limit <= 0 {
+			limit = 100
+		}
+		writeJSON(w, 200, M{"messages": a.peekMessages(queueName(r.URL.Query().Get("queue")), limit)})
 	default:
 		a.serveConsole(w, r, p)
 	}
@@ -256,6 +357,9 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	if len(os.Args) > 1 && os.Args[1] == "terraform-override" {
+		os.Exit(terraformOverride(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	cfg, err := loadConfig(os.Args[1:])
 	if errors.Is(err, flagHelp) {
 		return

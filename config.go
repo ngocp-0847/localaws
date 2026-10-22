@@ -85,6 +85,9 @@ type Resources struct {
 	SNS struct {
 		Topics []string `json:"topics"`
 	} `json:"sns"`
+	SQS struct {
+		Queues []QueueCfg `json:"queues"`
+	} `json:"sqs"`
 }
 
 type RunnerCfg struct {
@@ -123,14 +126,6 @@ func (c *Config) IdentityArn() string {
 		return c.Identity
 	}
 	return fmt.Sprintf("arn:aws:iam::%s:user/%s", c.Account, c.Identity)
-}
-
-func (c *Config) Subnets() map[string]bool {
-	m := map[string]bool{}
-	for _, s := range c.Resources.EC2.Subnets {
-		m[s.ID] = true
-	}
-	return m
 }
 
 // TaskEnv is added to every container (definition values win).
@@ -394,10 +389,12 @@ func (a *App) seed() error {
 	for _, g := range r.Logs.Groups {
 		a.ensureGroup(g)
 	}
+	a.seedEC2()
+	if err := a.seedQueues(r.SQS.Queues); err != nil {
+		return fmt.Errorf("sqs: %w", err)
+	}
 	for _, t := range r.SNS.Topics {
-		if !a.db.has("topic", t) {
-			_ = a.db.put("topic", t, Topic{Name: t, Created: nowMs()})
-		}
+		a.ensureTopic(t)
 	}
 	return nil
 }
